@@ -523,6 +523,21 @@ static common_chat_tool get_time_tool{
     })",
 };
 
+// Shape of Hermes' search_files: a trailing all-string enum argument (Gemma 4 leak case).
+static common_chat_tool gemma4_search_tool{
+    /* .name = */ "search_files",
+    /* .description = */ "Search files",
+    /* .parameters = */ R"({
+        "type": "object",
+        "properties": {
+            "pattern": { "type": "string" },
+            "target":  { "type": "string", "enum": ["content", "files"] },
+            "limit":   { "type": "integer" }
+        },
+        "required": ["pattern"]
+    })",
+};
+
 static common_chat_tool get_weather_tool{
     /* .name = */ "get_weather",
     /* .description = */ "Get the current weather in a city",
@@ -3188,45 +3203,62 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
 
         {
-            // Leak guard: a string value must not run past structural tokens.
-            // Real failure (Gemma 4 26B-A4B): model closes `target` with a plain '"' then emits
-            // <tool_call|><|tool_call>call:... and the old until(<|"|>) rule swallowed it all
-            // into the argument. With the guard the grammar rejects that continuation, so the
-            // model can't sample it.
+            // Gemma 4 enum constraint (local patch). Real failure on 26B-A4B: the model writes
+            // target:<|"|>files" and closes with a plain '"', then <tool_call|><|tool_call>call:...
+            // is swallowed into the argument by the generic until(<|"|>) string rule. With the
+            // enum constraint, after "files" the only legal continuation is <|"|>.
             auto tmpls = read_templates("models/templates/google-gemma-4-31B-it.jinja");
             common_chat_templates_inputs inputs;
             inputs.messages              = { message_user };
-            inputs.tools                 = { get_time_tool };
+            inputs.tools                 = { gemma4_search_tool, get_time_tool };
             inputs.add_generation_prompt = true;
-            auto params  = common_chat_templates_apply(tmpls.get(), inputs);
-            auto grammar = build_grammar(params.grammar);
-            if (!grammar) {
-                throw std::runtime_error("Gemma 4 leak guard: grammar failed to build");
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            if (!build_grammar(params.grammar)) {
+                throw std::runtime_error("Gemma 4 enum: grammar failed to build");
             }
-            const std::string good   = "<|tool_call>call:get_time{city:<|\"|>Paris<|\"|>}<tool_call|>";
-            const std::string leaked = "<|tool_call>call:get_time{city:<|\"|>files\"}<tool_call|>"
-                                       "<|tool_call>call:get_time{city:<|\"|>x<|\"|>}<tool_call|>";
-            if (!match_string_detailed(good, grammar.get()).success) {
-                throw std::runtime_error("Gemma 4 leak guard: valid call rejected");
-            }
-            auto grammar2 = build_grammar(params.grammar);
-            auto bad      = match_string_detailed(leaked, grammar2.get());
-            if (bad.success) {
-                throw std::runtime_error("Gemma 4 leak guard: leaked call accepted by grammar");
-            }
-            for (const char * tok : { "<tool_call|>", "<|tool_call>", "<|channel>", "<turn|>" }) {
+            auto accepts = [&](const std::string & s) {
                 auto g = build_grammar(params.grammar);
-                auto r = match_string_detailed(
-                    std::string("<|tool_call>call:get_time{city:<|\"|>a") + tok + "b<|\"|>}<tool_call|>", g.get());
-                if (r.success) {
-                    throw std::runtime_error(std::string("Gemma 4 leak guard: accepted ") + tok + " inside a string");
+                return match_string_detailed(s, g.get()).success;
+            };
+            const std::string open  = "<|tool_call>call:search_files{";
+            const std::string close = "}<tool_call|>";
+            const std::string q     = "<|\"|>";
+
+            // Accepted: valid enum values, any order, other arg types, the generic tool unchanged.
+            for (const std::string & ok : {
+                     open + "pattern:" + q + "*gift*" + q + ",target:" + q + "files" + q + close,
+                     open + "target:" + q + "content" + q + ",pattern:" + q + "x" + q + ",limit:5" + close,
+                     open + "pattern:" + q + "a \"q\" {b} <x|y>" + q + close,
+                     std::string("<|tool_call>call:get_time{city:") + q + "Paris" + q + close }) {
+                if (!accepts(ok)) {
+                    throw std::runtime_error("Gemma 4 enum: valid call rejected: " + ok);
                 }
             }
-            // Plain quotes, braces and '<' text remain legal inside values.
-            auto g3 = build_grammar(params.grammar);
-            if (!match_string_detailed("<|tool_call>call:get_time{city:<|\"|>a \"q\" {b} <x|y> c<|\"|>}<tool_call|>",
-                                       g3.get()).success) {
-                throw std::runtime_error("Gemma 4 leak guard: ordinary punctuation rejected inside a string");
+            // Rejected: the observed leak, an out-of-enum value, an undeclared key, a plain-quote close.
+            for (const std::string & bad : {
+                     open + "pattern:" + q + "*gift*" + q + ",target:" + q + "files\"}<tool_call|>"
+                         "<|tool_call>call:get_time{city:" + q + "x" + q + close,
+                     open + "pattern:" + q + "x" + q + ",target:" + q + "file" + q + close,
+                     open + "pattern:" + q + "x" + q + ",type:" + q + "files_only" + q + close,
+                     open + "pattern:" + q + "x" + q + ",target:" + q + "files\"" + close }) {
+                if (accepts(bad)) {
+                    throw std::runtime_error("Gemma 4 enum: invalid call accepted: " + bad);
+                }
+            }
+
+            // Parsed JSON: enum and plain args map back correctly, in emitted order.
+            common_peg_arena arena;
+            arena.load(params.parser);
+            common_chat_parser_params pp(params);
+            auto msg = common_chat_peg_parse(arena,
+                open + "pattern:" + q + "*gift*" + q + ",target:" + q + "files" + q + ",limit:5" + close,
+                /* is_partial = */ false, pp);
+            if (msg.tool_calls.size() != 1 || msg.tool_calls[0].name != "search_files") {
+                throw std::runtime_error("Gemma 4 enum: expected one search_files call");
+            }
+            auto args = json::parse(msg.tool_calls[0].arguments);
+            if (args != json{{"pattern", "*gift*"}, {"target", "files"}, {"limit", 5}}) {
+                throw std::runtime_error("Gemma 4 enum: wrong arguments " + msg.tool_calls[0].arguments);
             }
         }
 

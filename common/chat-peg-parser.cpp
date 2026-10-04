@@ -1051,6 +1051,58 @@ static std::string gemma4_to_json(const common_peg_ast_arena & arena, common_peg
         return "";
     }
 
+    // Enum-constrained dict (local patch; built in common/parsers/gemma4.cpp).
+    // Rule names are sanitised, so the JSON key is read from the node text (up to ':'),
+    // matching the generic dict-key rule, which also forbids ':' in keys.
+    auto starts_with = [](const std::string & s, const char * prefix) {
+        return s.rfind(prefix, 0) == 0;
+    };
+    const std::string rule_s(node.rule);
+
+    if (starts_with(rule_s, "gemma4-cdict-")) {
+        std::string result = "{";
+        bool add_comma = false;
+        for (auto child_id : node.children) {
+            if (add_comma) {
+                result += ',';
+            }
+            add_comma = true;
+            result += gemma4_to_json(arena, child_id);
+        }
+        if (!node.is_partial) {
+            result += '}';
+        }
+        return result;
+    }
+
+    if (starts_with(rule_s, "gemma4-pkv-") || starts_with(rule_s, "gemma4-ekv-")) {
+        const std::string text(node.text);
+        const auto colon = text.find(':');
+        if (colon == std::string::npos) {
+            return "";
+        }
+        std::string result = "\"" + escape_json_string_inner(text.substr(0, colon)) + "\":";
+        for (auto child_id : node.children) {
+            result += gemma4_to_json(arena, child_id);
+        }
+        return result;
+    }
+
+    if (starts_with(rule_s, "gemma4-ev-")) {
+        std::string value(node.text);
+        static const std::string close = "<|\"|>";
+        bool closed = value.size() >= close.size() &&
+                      value.compare(value.size() - close.size(), close.size(), close) == 0;
+        if (closed) {
+            value.resize(value.size() - close.size());
+        }
+        std::string result = "\"" + escape_json_string_inner(value);
+        if (closed && !node.is_partial) {
+            result += "\"";
+        }
+        return result;
+    }
+
     return "";
 }
 

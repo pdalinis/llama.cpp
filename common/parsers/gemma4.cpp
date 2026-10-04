@@ -1,5 +1,6 @@
 #include "parsers.h"
 
+#include <algorithm>
 namespace workaround {
 
 // Gemma4 uses a custom tool_responses field instead of role:tool messages.
@@ -220,14 +221,7 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
             // Gemma4 tool calling syntax
             // Rules should match traversal logic in gemma4_to_json()
-            // A string value ends only at <|"|>. Structural tokens are never valid inside a value:
-            // if the model closes a value with a plain '"' and then emits <tool_call|> / a new
-            // <|tool_call>, those must not be swallowed into the argument (and, under the lazy
-            // grammar, must not be sampleable here at all).
-            p.rule("gemma4-string-content", p.until_one_of({
-                "<|\"|>", "<tool_call|>", "<|tool_call>", "<|tool_response>", "<tool_response|>",
-                "<|channel>", "<channel|>", "<|turn>", "<turn|>",
-            }));
+            p.rule("gemma4-string-content", p.until("<|\"|>"));
             p.rule("gemma4-string", p.literal("<|\"|>") + p.ref("gemma4-string-content") + p.literal("<|\"|>"));
             p.rule("gemma4-bool", p.json_bool());
             p.rule("gemma4-null", p.json_null());
@@ -261,15 +255,95 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
 
             auto tool_choice = p.choice();
 
+            // Enum-constrained arguments (local patch, branch gemma4-string-guard).
+            // Gemma 4 26B-A4B often closes a short enum string such as target:"files" with a
+            // plain '"' instead of <|"|>, after which the generic until(<|"|>) string rule
+            // swallows <tool_call|>, the next call and thinking text into the argument.
+            // For a tool whose schema declares at least one all-string enum:
+            //   - keys are limited to the declared property names, and
+            //   - an enum value must be exactly one of its values followed by <|"|>,
+            // so after "files" the only legal continuation is the real close token.
+            // Tools without enums keep the generic gemma4-dict. Mapping back to JSON is in
+            // gemma4_to_json() (gemma4-cdict-*, gemma4-pkv-*, gemma4-ekv-* rules).
+            auto enum_values = [](const json & prop) -> std::vector<std::string> {
+                std::vector<std::string> out;
+                if (!prop.is_object() || !prop.contains("enum") || !prop.at("enum").is_array()) {
+                    return out;
+                }
+                if (prop.contains("type") && prop.at("type") != "string") {
+                    return out;
+                }
+                for (const auto & v : prop.at("enum")) {
+                    if (!v.is_string()) {
+                        return {};
+                    }
+                    out.push_back(v.get<std::string>());
+                }
+                return out;
+            };
+
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
-                // TODO @aldehir : need to extend json-schema-to-grammar to produce more than JSON rules
-                // const auto & params   = function.at("parameters");
+
+                json props = json::object();
+                if (function.contains("parameters") && function.at("parameters").is_object() &&
+                    function.at("parameters").contains("properties") &&
+                    function.at("parameters").at("properties").is_object()) {
+                    props = function.at("parameters").at("properties");
+                }
+
+                bool has_enum = false;
+                for (const auto & [key, prop] : props.items()) {
+                    if (!enum_values(prop).empty()) {
+                        has_enum = true;
+                    }
+                }
+
+                auto args = p.ref("gemma4-dict");
+                if (has_enum) {
+                    // Longest keys first so no key literal is a prefix match for another.
+                    std::vector<std::string> keys;
+                    for (const auto & [key, prop] : props.items()) {
+                        keys.push_back(key);
+                    }
+                    std::sort(keys.begin(), keys.end(), [](const std::string & a, const std::string & b) {
+                        return a.size() > b.size();
+                    });
+
+                    auto member = p.choice();
+                    for (const auto & key : keys) {
+                        auto values = enum_values(props.at(key));
+                        if (values.empty()) {
+                            member |= p.rule("gemma4-pkv-" + name + "-" + key,
+                                p.literal(key + ":") + p.space() + p.ref("gemma4-value"));
+                        } else {
+                            std::sort(values.begin(), values.end(), [](const std::string & a, const std::string & b) {
+                                return a.size() > b.size();
+                            });
+                            auto value = p.choice();
+                            for (const auto & v : values) {
+                                value |= p.literal(v + "<|\"|>");
+                            }
+                            member |= p.rule("gemma4-ekv-" + name + "-" + key,
+                                p.literal(key + ":") + p.space() + p.literal("<|\"|>") +
+                                p.rule("gemma4-ev-" + name + "-" + key, value));
+                        }
+                    }
+
+                    args = p.rule("gemma4-cdict-" + name, [&]() {
+                        auto ws      = p.space();
+                        auto members = p.sequence({member, p.zero_or_more(p.sequence({p.literal(","), ws, member}))});
+                        return p.sequence({
+                            p.literal("{"), ws,
+                            p.choice({p.literal("}"), p.sequence({members, ws, p.literal("}")})})
+                        });
+                    });
+                }
 
                 tool_choice |= p.rule("tool-" + name, p.tool(p.sequence({
                     p.tool_open(p.tool_name(p.literal(name)) + p.peek(p.literal("{"))),
-                    p.tool_args(p.ref("gemma4-dict")),
+                    p.tool_args(args),
                 })));
             });
 
