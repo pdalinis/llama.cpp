@@ -220,7 +220,14 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
             // Gemma4 tool calling syntax
             // Rules should match traversal logic in gemma4_to_json()
-            p.rule("gemma4-string-content", p.until("<|\"|>"));
+            // A string value ends only at <|"|>. Structural tokens are never valid inside a value:
+            // if the model closes a value with a plain '"' and then emits <tool_call|> / a new
+            // <|tool_call>, those must not be swallowed into the argument (and, under the lazy
+            // grammar, must not be sampleable here at all).
+            p.rule("gemma4-string-content", p.until_one_of({
+                "<|\"|>", "<tool_call|>", "<|tool_call>", "<|tool_response>", "<tool_response|>",
+                "<|channel>", "<channel|>", "<|turn>", "<turn|>",
+            }));
             p.rule("gemma4-string", p.literal("<|\"|>") + p.ref("gemma4-string-content") + p.literal("<|\"|>"));
             p.rule("gemma4-bool", p.json_bool());
             p.rule("gemma4-null", p.json_null());

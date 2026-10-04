@@ -3188,6 +3188,49 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
 
         {
+            // Leak guard: a string value must not run past structural tokens.
+            // Real failure (Gemma 4 26B-A4B): model closes `target` with a plain '"' then emits
+            // <tool_call|><|tool_call>call:... and the old until(<|"|>) rule swallowed it all
+            // into the argument. With the guard the grammar rejects that continuation, so the
+            // model can't sample it.
+            auto tmpls = read_templates("models/templates/google-gemma-4-31B-it.jinja");
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { message_user };
+            inputs.tools                 = { get_time_tool };
+            inputs.add_generation_prompt = true;
+            auto params  = common_chat_templates_apply(tmpls.get(), inputs);
+            auto grammar = build_grammar(params.grammar);
+            if (!grammar) {
+                throw std::runtime_error("Gemma 4 leak guard: grammar failed to build");
+            }
+            const std::string good   = "<|tool_call>call:get_time{city:<|\"|>Paris<|\"|>}<tool_call|>";
+            const std::string leaked = "<|tool_call>call:get_time{city:<|\"|>files\"}<tool_call|>"
+                                       "<|tool_call>call:get_time{city:<|\"|>x<|\"|>}<tool_call|>";
+            if (!match_string_detailed(good, grammar.get()).success) {
+                throw std::runtime_error("Gemma 4 leak guard: valid call rejected");
+            }
+            auto grammar2 = build_grammar(params.grammar);
+            auto bad      = match_string_detailed(leaked, grammar2.get());
+            if (bad.success) {
+                throw std::runtime_error("Gemma 4 leak guard: leaked call accepted by grammar");
+            }
+            for (const char * tok : { "<tool_call|>", "<|tool_call>", "<|channel>", "<turn|>" }) {
+                auto g = build_grammar(params.grammar);
+                auto r = match_string_detailed(
+                    std::string("<|tool_call>call:get_time{city:<|\"|>a") + tok + "b<|\"|>}<tool_call|>", g.get());
+                if (r.success) {
+                    throw std::runtime_error(std::string("Gemma 4 leak guard: accepted ") + tok + " inside a string");
+                }
+            }
+            // Plain quotes, braces and '<' text remain legal inside values.
+            auto g3 = build_grammar(params.grammar);
+            if (!match_string_detailed("<|tool_call>call:get_time{city:<|\"|>a \"q\" {b} <x|y> c<|\"|>}<tool_call|>",
+                                       g3.get()).success) {
+                throw std::runtime_error("Gemma 4 leak guard: ordinary punctuation rejected inside a string");
+            }
+        }
+
+        {
             // additional tests for https://github.com/ggml-org/llama.cpp/pull/21760
             auto tmpls = read_templates("models/templates/google-gemma-4-31B-it.jinja");
 
